@@ -2,7 +2,10 @@ import pandas as pd
 import rasterio
 from rasterio.warp import reproject, Resampling
 from scipy.ndimage import gaussian_filter
+import scipy.ndimage
+from scipy.spatial import cKDTree
 import numpy as np
+
 
 
 quality_dict = {'A2': 0, 'B': 1, 'C': 2, 'D': 3}
@@ -43,13 +46,10 @@ width = int((overall_right - overall_left) / resolution)
 height = int((overall_top - overall_bottom) / resolution)
 transform = rasterio.transform.from_origin(overall_left, overall_top, resolution, resolution)
 
-
 with rasterio.open(df['path'][0]) as first_dataset:
     crs = first_dataset.crs if first_dataset.crs else rasterio.crs.CRS.from_string('EPSG:3826')
 
-
 data = np.full((height, width), np.nan)
-
 
 filled_mask = np.zeros((height, width), dtype=bool)
 
@@ -59,7 +59,8 @@ with rasterio.open('output.tif', 'w', driver='GTiff',
                    crs=crs, transform=transform) as dst:
     dst.write(data, 1)
 
-# Step 4: Fill the new raster file
+
+
 with rasterio.open('output.tif', 'r+') as dst:
     for index, row in df.iterrows():
         # If all pixels have been filled, we can stop
@@ -95,8 +96,42 @@ with rasterio.open('output.tif', 'r+') as dst:
 
         except rasterio.errors.RasterioIOError:
             print(f"Could not load {file_path}")
-			
 
+    data = dst.read(1)
+    smoothed_data = scipy.ndimage.gaussian_filter(data, sigma=1)  # Adjust sigma as needed
+
+    # Fill holes that are within 10 pixels from valid data
+    y_indices, x_indices = np.indices(data.shape)
+    valid_mask = ~np.isnan(smoothed_data)
+    valid_y_indices = y_indices[valid_mask]
+    valid_x_indices = x_indices[valid_mask]
+    valid_values = smoothed_data[valid_mask]
+
+    tree = cKDTree(np.column_stack((valid_y_indices, valid_x_indices)))
+    hole_y_indices = y_indices[~valid_mask]
+    hole_x_indices = x_indices[~valid_mask]
+    distances, indices = tree.query(np.column_stack((hole_y_indices, hole_x_indices)), k=5, distance_upper_bound=10)    
+    
+    # Create a mask for valid indices
+    valid_indices_mask = indices != tree.n
+    
+    # Average the values of the 5 nearest pixels
+    hole_values = np.empty(len(indices))
+    for i, (index_row, distance_row) in enumerate(zip(indices, distances)):
+        valid_indices = index_row[valid_indices_mask[i]]
+        valid_distances = distance_row[valid_indices_mask[i]]
+    
+        if len(valid_indices) > 0:
+            hole_values[i] = np.average(valid_values[valid_indices], weights=(1/valid_distances))
+        else:
+            hole_values[i] = np.nan
+
+    smoothed_data[~valid_mask] = hole_values
+
+    dst.write(smoothed_data, 1)
+	
+	
+# Smooth
 def smooth_lowess(data, frac=0.3):
     x = np.arange(len(data))
     valid_mask = ~np.isnan(data)
@@ -118,11 +153,11 @@ with rasterio.open('output.tif') as src:
     data = src.read(1)
 
 # Initialize an empty array for the smoothed band
-smoothed_band = np.empty_like(band)
+smoothed_band = np.empty_like(data)
 
 # Apply the smoothing function to each column
-for i in range(band.shape[1]):
-    smoothed_band[:, i] = smooth_lowess(band[:, i])
+for i in range(data.shape[1]):
+    smoothed_band[:, i] = smooth_lowess(data[:, i])
 
 with rasterio.open('output_smoothed.tif', 'w', **src.profile) as dst:
     dst.write(smoothed_band, 1)
