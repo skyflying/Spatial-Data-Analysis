@@ -1,27 +1,40 @@
+# Griding bathymetry data from BDB source
+# version 2021-10-25 Ming-Yi Hsu
+# version 2021-12-01 Ming-Yi Hsu Modified the smoothing function based on IHO and GEBCO(LOWESS) 
+# version 2023-06-12 Ming-Yi Hsu Fixed some issue
+
+
 import pandas as pd
+from scipy.ndimage import gaussian_filter
+import numpy as np
 import rasterio
 from rasterio.warp import reproject, Resampling
-from scipy.ndimage import gaussian_filter
+from statsmodels.nonparametric.smoothers_lowess import lowess
 import scipy.ndimage
+from scipy.ndimage import binary_closing
 from scipy.spatial import cKDTree
-import numpy as np
 
 
-
-quality_dict = {'A2': 0, 'B': 1, 'C': 2, 'D': 3}
-df['quality_sortable'] = df['quality'].map(quality_dict)
-
-# Sort by date and quality
-df = df.sort_values(by=['date', 'quality_sortable'], ascending=[False, True])
 
 # Step 1: Read CSV file
 df = pd.read_csv('file_list.csv')
+# Convert quality to sortable form
+quality_dict = {'A2': 0, 'B': 1, 'C': 2, 'D': 3}
+df['quality_sortable'] = df['CATZOC'].map(quality_dict)
+
+# Sort by date and quality
+df = df.sort_values(by=['DATEND', 'quality_sortable'], ascending=[False, True])
+
+
 
 # Function to get the bounding box of a raster dataset
 def get_bounds(dataset):
     left, bottom, right, top = dataset.bounds
     return left, bottom, right, top
-
+    
+    
+    
+    
 # Step 2: Calculate the overall bounding box
 overall_left = float('inf')
 overall_bottom = float('inf')
@@ -39,6 +52,7 @@ for index, row in df.iterrows():
             overall_top = max(overall_top, top)
     except rasterio.errors.RasterioIOError:
         print(f"Could not load {file_path}")
+        
 
 # Step 3: Create a new raster that covers the overall bounding box
 resolution = 1  # 10 meters per pixel
@@ -46,14 +60,17 @@ width = int((overall_right - overall_left) / resolution)
 height = int((overall_top - overall_bottom) / resolution)
 transform = rasterio.transform.from_origin(overall_left, overall_top, resolution, resolution)
 
+# Use the same CRS as the first GeoTIFF file
 with rasterio.open(df['path'][0]) as first_dataset:
     crs = first_dataset.crs if first_dataset.crs else rasterio.crs.CRS.from_string('EPSG:3826')
 
+# Initialize all pixel values to NaN
 data = np.full((height, width), np.nan)
 
+# Initialize a mask that tracks which pixels have been filled
 filled_mask = np.zeros((height, width), dtype=bool)
 
-
+# Create the new GeoTIFF file
 with rasterio.open('output.tif', 'w', driver='GTiff',
                    height=height, width=width, count=1, dtype=str(data.dtype),
                    crs=crs, transform=transform) as dst:
@@ -61,6 +78,8 @@ with rasterio.open('output.tif', 'w', driver='GTiff',
 
 
 
+
+# Step 4: Fill the new raster file
 with rasterio.open('output.tif', 'r+') as dst:
     for index, row in df.iterrows():
         # If all pixels have been filled, we can stop
@@ -97,15 +116,13 @@ with rasterio.open('output.tif', 'r+') as dst:
         except rasterio.errors.RasterioIOError:
             print(f"Could not load {file_path}")
 
-    data = dst.read(1)
-    smoothed_data = scipy.ndimage.gaussian_filter(data, sigma=1)  # Adjust sigma as needed
 
     # Fill holes that are within 10 pixels from valid data
     y_indices, x_indices = np.indices(data.shape)
-    valid_mask = ~np.isnan(smoothed_data)
+    valid_mask = ~np.isnan(data)
     valid_y_indices = y_indices[valid_mask]
     valid_x_indices = x_indices[valid_mask]
-    valid_values = smoothed_data[valid_mask]
+    valid_values = data[valid_mask]
 
     tree = cKDTree(np.column_stack((valid_y_indices, valid_x_indices)))
     hole_y_indices = y_indices[~valid_mask]
@@ -115,24 +132,37 @@ with rasterio.open('output.tif', 'r+') as dst:
     # Create a mask for valid indices
     valid_indices_mask = indices != tree.n
     
-    # Average the values of the 5 nearest pixels
-    hole_values = np.empty(len(indices))
-    for i, (index_row, distance_row) in enumerate(zip(indices, distances)):
-        valid_indices = index_row[valid_indices_mask[i]]
-        valid_distances = distance_row[valid_indices_mask[i]]
+
+    # Create a binary mask for the valid data
+    binary_mask = ~np.isnan(data)
+
+    # Apply morphological closing to the binary mask
+    closed_mask = binary_closing(binary_mask, structure=np.ones((5,5)))  # Adjust the structure as needed
+
+    # Find holes that are surrounded by valid data
+    surrounded_holes = np.logical_and(~binary_mask, closed_mask)
+
+    # Find the y and x indices of the surrounded holes
+    surrounded_holes_y_indices = y_indices[surrounded_holes]
+    surrounded_holes_x_indices = x_indices[surrounded_holes]
+
+    # Fill the surrounded holes
+    for y, x in zip(surrounded_holes_y_indices, surrounded_holes_x_indices):
+        indices = tree.query_ball_point((y, x), r=5)  # Adjust the radius as needed
+
+        # If there are no points within the radius, continue to the next hole
+        if len(indices) == 0:
+            continue
+
+        # Average the values of the points within the radius
+        hole_value = np.average(valid_values[indices])
+
+        # Fill the hole with the averaged value
+        data[y, x] = hole_value
+
+    dst.write(data, 1)
     
-        if len(valid_indices) > 0:
-            hole_values[i] = np.average(valid_values[valid_indices], weights=(1/valid_distances))
-        else:
-            hole_values[i] = np.nan
-
-    smoothed_data[~valid_mask] = hole_values
-
-    dst.write(smoothed_data, 1)
-	
-	
-# Smooth
-def smooth_lowess(data, frac=0.3):
+def smooth_lowess(data, frac=0.05):
     x = np.arange(len(data))
     valid_mask = ~np.isnan(data)
     x_valid = x[valid_mask]
@@ -161,24 +191,3 @@ for i in range(data.shape[1]):
 
 with rasterio.open('output_smoothed.tif', 'w', **src.profile) as dst:
     dst.write(smoothed_band, 1)
-	
-def geotiff_to_xyz(input_geotiff, output_xyz):
-    with rasterio.open(input_geotiff) as src:
-        affine = src.transform
-        array = src.read(1)
-        array[array == src.nodata] = np.nan  # handle nodata values if any
-
-    height, width = array.shape
-
-    x_coordinates = np.arange(width) * affine[0] + affine[2]
-    y_coordinates = np.arange(height) * affine[4] + affine[5]
-
-    x_coordinates, y_coordinates = np.meshgrid(x_coordinates, y_coordinates)
-
-    stacked_coordinates = np.column_stack((x_coordinates.flatten(), y_coordinates.flatten(), array.flatten()))
-
-    np.savetxt(output_xyz, stacked_coordinates, delimiter=',', fmt='%f')
-
-
-geotiff_to_xyz('output.tif', 'output.xyz')
-geotiff_to_xyz('output_smoothed.tif', 'utput_smoothed.xyz')
