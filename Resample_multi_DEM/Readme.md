@@ -1,1 +1,1 @@
-It is a tool for resampling multi-bathymetry data. This method is considered IHO S-57 regulation including survey date and survey quality.
+It is a python script for combining and resampling multiple bathymetry data. This method is considered IHO S-57 regulation including survey date and survey quality(CATZOC). Meanwhile, it could use for many Geotif survey results for combined with one Geotif.
