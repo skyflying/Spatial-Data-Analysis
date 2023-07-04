@@ -162,8 +162,8 @@ with rasterio.open('output.tif', 'r+') as dst:
 
     dst.write(data, 1)
     
-def smooth_lowess(data, frac=0.05):
-    x = np.arange(len(data))
+def smooth_lowess(data, frac=0.08):
+    x = np.arange(data.shape[0])
     valid_mask = ~np.isnan(data)
     x_valid = x[valid_mask]
     data_valid = data[valid_mask]
@@ -178,16 +178,25 @@ def smooth_lowess(data, frac=0.05):
     smoothed[valid_mask] = np.interp(x_valid, smoothed_valid[:, 0], smoothed_valid[:, 1])
     return smoothed
 
+def smooth_lowess_2d(data, frac=0.08):
+    smoothed = np.empty_like(data)
+
+    # Apply LOWESS to each row
+    for i in range(data.shape[0]):
+        smoothed[i, :] = smooth_lowess(data[i, :], frac=frac)
+
+    # Apply LOWESS to each column
+    for i in range(data.shape[1]):
+        smoothed[:, i] = smooth_lowess(smoothed[:, i], frac=frac)
+
+    return smoothed
+
+
 with rasterio.open('output.tif') as src:
     profile = src.profile
     data = src.read(1)
 
-# Initialize an empty array for the smoothed band
-smoothed_band = np.empty_like(data)
-
-# Apply the smoothing function to each column
-for i in range(data.shape[1]):
-    smoothed_band[:, i] = smooth_lowess(data[:, i])
+smoothed_band = smooth_lowess_2d(data)
 
 with rasterio.open('output_smoothed.tif', 'w', **src.profile) as dst:
     dst.write(smoothed_band, 1)
