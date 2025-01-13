@@ -1,84 +1,125 @@
 import geopandas as gpd
 import rasterio
 from rasterio import features
+from rasterio.transform import rowcol
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 from tqdm import tqdm  
+from shapely.geometry import box
+
+# File paths (update these paths if needed)
+geotiff_path = r'Dredging Level with buffer zone.tif'
+gpkg_path = r'With_buffer.gpkg'
+output_geotiff = r'output_new_geotiff_vh_corrected_position.tif'
 
 
-geotiff_path = r'C:\Users\MingyiHsu\OneDrive - HL\Desktop\test2024.tif'
-gpkg_path = r'G:\Shared drives\Project Work Clients Other\Hai Long\2_Working_Data\20241014_HL3_EXP_Site_Volume_Calc_\output_buffers_2024 part\all_buffers.gpkg'
-output_geotiff = r'output_new_geotiff_vh_corrected_with_progress_ff.tif'
+# Parameters for user to adjust
+vh_ratio = 3  # V:H ratio (e.g., 1:3 as 3)
+threshold_distance_meters = 20  # Set the maximum distance for V:H adjustment in meters
 
-
-min_horizontal_distance = 20.0  # Minimum horizontal distance in pixel
-vh_ratio = 3.0  # V:H ratio (e.g., 1:3 as 3)
-
-# Load the GPKG (polygon) data
+# Load GPKG data
 gpkg_data = gpd.read_file(gpkg_path)
 
-# Filter out rows with NaN in 'Depth' column
-gpkg_data = gpkg_data[~gpkg_data['target_dep'].isnull()]
-
-# Load the GeoTIFF (raster) data
+# Load GeoTIFF data
 with rasterio.open(geotiff_path) as src:
-    geotiff_data = src.read(1)  # Read the first band
+    geotiff_data = src.read(1)  # Read first band
     geotiff_transform = src.transform
-    geotiff_crs = src.crs
-    geotiff_bounds = src.bounds
     geotiff_profile = src.profile
+    geotiff_bounds = src.bounds  # Get GeoTIFF bounds
+    geotiff_resolution = src.res[0]  # Get resolution (meters per pixel)
 
-# Create an empty surface to store adjusted depths
+# Convert threshold distance from meters to pixels
+threshold_distance_pixels = threshold_distance_meters / geotiff_resolution
+
+# Create a copy of the GeoTIFF data for adjusted depths
 adjusted_surface = np.copy(geotiff_data)
 
-# Initialize a mask with NaNs to store the depth from the polygons
+# Create an empty surface to store the polygon depth values
 flat_surface = np.full(geotiff_data.shape, np.nan)
 
-# Loop over each polygon and set depth values
+# Function to adjust depths starting from the polygon boundary outward
+def adjust_depth_from_boundary(y, x, flat_surface, geotiff_data, distance_to_boundary, vh_ratio, boundary_depth):
+    delta_z = distance_to_boundary[y, x] / vh_ratio
+    new_depth = boundary_depth + delta_z
+    # Ensure the depth does not become shallower than the GeoTIFF value
+    return min(new_depth, geotiff_data[y, x])
+
+# Process each polygon
 for index, row in gpkg_data.iterrows():
     polygon = row['geometry']
-    depth_value = row['target_dep']
-    
-    # Create mask for the polygon
-    mask = features.geometry_mask([polygon], out_shape=flat_surface.shape, transform=geotiff_transform, invert=True)
-    
-    # Fill the mask area with the depth value
-    flat_surface[mask] = depth_value
+    depth_value = row['Depth']
 
-# Calculate distance to the nearest polygon boundary using distance transform
-distance_to_polygon = distance_transform_edt(np.isnan(flat_surface))
+    # Create a buffer to limit calculations, but not to calculate every point within the buffer
+    buffered_polygon = polygon.buffer(threshold_distance_meters)
 
-# Function to adjust depth based on neighborhood and distance
-def adjust_depth(y, x, flat_surface, distance_to_polygon, vh_ratio, geotiff_data, min_horizontal_distance):
-    if not np.isnan(flat_surface[y, x]):
-        return flat_surface[y, x]  # Inside the polygon, keep the flat depth
-    else:
-        effective_distance = max(distance_to_polygon[y, x], min_horizontal_distance)  # Ensure a minimum horizontal distance
-        if effective_distance > 0:
-            # Get valid neighboring depths within a larger neighborhood (e.g., 5x5)
-            neighborhood = flat_surface[max(0, y-5):min(flat_surface.shape[0], y+5), max(0, x-5):min(flat_surface.shape[1], x+5)]
-            valid_depths = neighborhood[~np.isnan(neighborhood)]
-            
-            if len(valid_depths) > 0:
-                nearest_depth = np.min(valid_depths)
-                delta_z = effective_distance / vh_ratio  # Apply user-defined V:H ratio
-                new_value = nearest_depth + delta_z
-                return min(new_value, geotiff_data[y, x])  # Ensure new value does not exceed the original GeoTIFF value
-        return geotiff_data[y, x]  # If no valid neighboring depth, keep the original GeoTIFF value
+    # Clip the buffered polygon to GeoTIFF bounds to avoid unnecessary calculations
+    clipped_polygon = buffered_polygon.intersection(box(*geotiff_bounds))
 
-# Initialize progress bar
-total_pixels = flat_surface.shape[0] * flat_surface.shape[1]
-with tqdm(total=total_pixels, desc="Processing GeoTIFF with adjustable parameters") as pbar:
-    # Adjust the surrounding areas based on the user-defined V:H ratio
-    for y in range(flat_surface.shape[0]):
-        for x in range(flat_surface.shape[1]):
-            adjusted_surface[y, x] = adjust_depth(y, x, flat_surface, distance_to_polygon, vh_ratio, geotiff_data, min_horizontal_distance)
-        pbar.update(flat_surface.shape[1])  # Update after processing each row
+    if clipped_polygon.is_empty:
+        continue
 
-# Update the GeoTIFF profile for output (new GeoTIFF)
+    # Calculate the bounding box of the clipped polygon to limit the calculation range
+    minx, miny, maxx, maxy = clipped_polygon.bounds
+
+    # Use the 'src.index' method to convert world coordinates (lon/lat) to row/col
+    row_min, col_min = src.index(minx, maxy)  # Top-left corner
+    row_max, col_max = src.index(maxx, miny)  # Bottom-right corner
+
+    # Convert to integers
+    row_min, row_max = int(row_min), int(row_max)
+    col_min, col_max = int(col_min), int(col_max)
+
+    # Ensure valid dimensions for the sub-region
+    if row_min >= row_max or col_min >= col_max or row_min < 0 or col_min < 0:
+        print(f"Invalid bounding box for polygon at index {index}. Skipping this polygon.")
+        continue
+
+    # Check if the calculated shape is valid
+    block_shape = (row_max - row_min, col_max - col_min)
+    if block_shape[0] <= 0 or block_shape[1] <= 0:
+        print(f"Skipping polygon at index {index} due to invalid block shape.")
+        continue
+
+    # Extract the sub-region of the GeoTIFF and flat_surface for this polygon
+    flat_surface_block = flat_surface[row_min:row_max, col_min:col_max]
+    adjusted_surface_block = adjusted_surface[row_min:row_max, col_min:col_max]
+    geotiff_block = geotiff_data[row_min:row_max, col_min:col_max]
+
+    # Define the transform for this sub-region
+    sub_transform = rasterio.transform.from_bounds(minx, miny, maxx, maxy, block_shape[1], block_shape[0])
+
+    # Create mask for the original polygon to define the true boundary
+    polygon_mask = features.geometry_mask([polygon], out_shape=block_shape, transform=sub_transform, invert=True)
+
+    # Debug information: Check the mask and block shape
+    print(f"Index {index}: polygon_mask shape: {polygon_mask.shape}, flat_surface_block shape: {flat_surface_block.shape}")
+
+    # Ensure the mask has the correct shape before applying
+    if polygon_mask.shape != flat_surface_block.shape:
+        print(f"Shape mismatch at index {index}: polygon_mask shape {polygon_mask.shape}, flat_surface_block shape {flat_surface_block.shape}")
+        continue
+
+    # Assign depth values inside the original polygon
+    flat_surface_block[polygon_mask] = depth_value
+    adjusted_surface_block[polygon_mask] = np.where(geotiff_block[polygon_mask] < depth_value,
+                                                    geotiff_block[polygon_mask], depth_value)
+
+    # Calculate distance from the original polygon boundary outward, limited to the buffer area
+    distance_to_boundary = distance_transform_edt(~polygon_mask) * geotiff_resolution
+
+    # Initialize progress bar
+    with tqdm(total=np.count_nonzero(polygon_mask), desc="Optimized depth calculation", unit="pixel") as pbar:
+        # Adjust depths based on distance and V:H ratio, limited to the bounding box and within the buffer area
+        for y in range(row_max - row_min):
+            for x in range(col_max - col_min):
+                if np.isnan(flat_surface_block[y, x]) and distance_to_boundary[y, x] <= threshold_distance_pixels:
+                    adjusted_surface_block[y, x] = adjust_depth_from_boundary(y, x, flat_surface_block, geotiff_block,
+                                                                              distance_to_boundary, vh_ratio, depth_value)
+                pbar.update(1)
+
+# Save the adjusted GeoTIFF
 geotiff_profile.update(dtype=rasterio.float32, count=1, compress='lzw')
 
-# Write the new GeoTIFF
 with rasterio.open(output_geotiff, 'w', **geotiff_profile) as dst:
     dst.write(adjusted_surface.astype(rasterio.float32), 1)
 
