@@ -5,6 +5,7 @@ from math import sqrt
 import os
 from pyproj import Transformer
 import rasterio
+import numpy as np
 
 def display_fields_and_samples(gdf):
     """顯示可用的欄位和前 10 行數據。"""
@@ -21,34 +22,21 @@ def display_fields_and_samples(gdf):
     return True
 
 def sample_elevation(point, src_array, transform, search_radius, nodata_value):
-    """取樣 GeoTIFF 值，若無值則進行最近鄰內插。"""
+    """取樣 GeoTIFF 值，若無值則不取樣。"""
     if src_array is None or transform is None:
         return None
 
     px, py = ~transform * (point.x, point.y)
     px, py = int(px), int(py)
 
+    # 檢查是否在範圍內
     if 0 <= px < src_array.shape[1] and 0 <= py < src_array.shape[0]:
         value = src_array[py, px]
-        if value != nodata_value:
+        # 檢查是否為有效值（不為nodata且不為-9999）
+        if value != nodata_value and value != -9999 and not np.isnan(value):
             return value
 
-    radius_pixels = int(search_radius / transform.a)
-    neighbors = []
-
-    for dx in range(-radius_pixels, radius_pixels + 1):
-        for dy in range(-radius_pixels, radius_pixels + 1):
-            nx, ny = px + dx, py + dy
-            if 0 <= nx < src_array.shape[1] and 0 <= ny < src_array.shape[0]:
-                value = src_array[ny, nx]
-                if value != nodata_value:
-                    distance = sqrt(dx ** 2 + dy ** 2)
-                    neighbors.append((value, distance))
-
-    if neighbors:
-        neighbors.sort(key=lambda x: x[1])
-        return neighbors[0][0]
-
+    # 如果主要點無效，則不進行最近鄰搜索，直接返回None
     return None
 
 def process_line_data(file_path, geotiff_path):
@@ -73,8 +61,8 @@ def process_line_data(file_path, geotiff_path):
     output_directory = "output_files_with_nodes_and_crs"
     os.makedirs(output_directory, exist_ok=True)
 
-    fixed_distance = float(input("Enter the spacing distance: "))
-    include_original_nodes = input("Include original nodes? (yes/no): ").strip().lower() == 'yes'
+    fixed_distance = float(input("Enter the spacing distance (0 for original nodes only): "))
+    include_original_nodes = True if fixed_distance == 0 else input("Include original nodes? (yes/no): ").strip().lower() == 'yes'
     retain_attributes = input("Retain original line attributes? (yes/no): ").strip().lower() == 'yes'
     export_shapefile = input("Export Shapefile? (yes/no): ").strip().lower() == 'yes'
 
@@ -111,35 +99,46 @@ def process_line_data(file_path, geotiff_path):
             current_distance = 0
 
             original_points = []
-            if include_original_nodes:
-                if line.geom_type == 'LineString':
-                    original_points = list(line.coords)
-                elif line.geom_type == 'MultiLineString':
-                    for linestring in line.geoms:
-                        original_points.extend(linestring.coords)
+            # 總是收集原始節點，但根據參數決定是否使用
+            if line.geom_type == 'LineString':
+                original_points = list(line.coords)
+            elif line.geom_type == 'MultiLineString':
+                for linestring in line.geoms:
+                    original_points.extend(linestring.coords)
 
             points = set()
-            while current_distance <= length:
-                point = line.interpolate(current_distance)
-                points.add((point, current_distance))
-                current_distance += fixed_distance
-
-            if current_distance - fixed_distance < length:
-                end_point = line.interpolate(length)
-                points.add((end_point, length))
-
-            if include_original_nodes:
+            
+            # 如果間距為0，僅使用原始節點
+            if fixed_distance == 0:
                 for pt in original_points:
                     point = Point(pt)
                     distance_along_line = line.project(point)
                     points.add((point, distance_along_line))
+            else:
+                # 正常處理固定間距節點
+                while current_distance <= length:
+                    point = line.interpolate(current_distance)
+                    points.add((point, current_distance))
+                    current_distance += fixed_distance
+
+                if current_distance - fixed_distance < length:
+                    end_point = line.interpolate(length)
+                    points.add((end_point, length))
+
+                if include_original_nodes:
+                    for pt in original_points:
+                        point = Point(pt)
+                        distance_along_line = line.project(point)
+                        points.add((point, distance_along_line))
 
             sorted_points = sorted(points, key=lambda x: x[1])
 
             prev_point = None
             for i, (point, distance_along_line) in enumerate(sorted_points):
                 lon, lat = transformer_to_4326.transform(point.x, point.y)
-                elevation = sample_elevation(point, geotiff_array, transform, fixed_distance * 2, nodata_value)
+                
+                # 取樣高程，如果無效則為None
+                elevation = sample_elevation(point, geotiff_array, transform, fixed_distance * 2, nodata_value) if use_geotiff else None
 
                 distance_meters = None
                 length_3d = None
@@ -158,11 +157,11 @@ def process_line_data(file_path, geotiff_path):
                     "Latitude": lat,
                     "Easting": point.x,
                     "Northing": point.y,
-                    "Elevation": elevation,
-                    "Distance_Meters": distance_meters,
-                    "Length_3D": length_3d if use_geotiff else None,
+                    "Elevation": elevation if use_geotiff else None,
+                    "Distance": distance_meters,
+                    "Length_3D": length_3d if (use_geotiff and elevation is not None and prev_point and prev_point[2] is not None) else None,
                     "KP": round(distance_along_line, 3),
-                    "Total_3D_Length": total_3d_length if use_geotiff else None,
+                    "Total_3D_Length": total_3d_length if (use_geotiff and elevation is not None) else None,
                     field_name: unique_value
                 }
 
@@ -178,12 +177,12 @@ def process_line_data(file_path, geotiff_path):
         if nodes_data:
             segment_count += 1
             nodes_df = pd.DataFrame(nodes_data)
-            csv_file = os.path.join(output_directory, f"{unique_value}_nodes.csv")
+            csv_file = os.path.join(output_directory, f"{unique_value}_KP.csv")
             nodes_df.to_csv(csv_file, index=False)
 
             if export_shapefile:
                 gdf_output = gpd.GeoDataFrame(nodes_df, geometry=geometry_data, crs=gdf.crs)
-                shp_file = os.path.join(output_directory, f"{unique_value}_nodes.shp")
+                shp_file = os.path.join(output_directory, f"{unique_value}_KP.shp")
                 gdf_output.to_file(shp_file, driver="ESRI Shapefile")
                 print(f"Shapefile saved to: {shp_file} with EPSG: {gdf.crs.to_string()}")
 
