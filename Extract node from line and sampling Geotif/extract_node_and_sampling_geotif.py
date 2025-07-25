@@ -8,7 +8,6 @@ import rasterio
 import numpy as np
 
 def display_fields_and_samples(gdf):
-    """顯示可用的欄位和前 10 行數據。"""
     if gdf.empty:
         print("Error: The input GeoDataFrame is empty. Please check the input file.")
         return False
@@ -22,21 +21,16 @@ def display_fields_and_samples(gdf):
     return True
 
 def sample_elevation(point, src_array, transform, search_radius, nodata_value):
-    """取樣 GeoTIFF 值，若無值則不取樣。"""
     if src_array is None or transform is None:
         return None
 
     px, py = ~transform * (point.x, point.y)
     px, py = int(px), int(py)
 
-    # 檢查是否在範圍內
     if 0 <= px < src_array.shape[1] and 0 <= py < src_array.shape[0]:
         value = src_array[py, px]
-        # 檢查是否為有效值（不為nodata且不為-9999）
         if value != nodata_value and value != -9999 and not np.isnan(value):
             return value
-
-    # 如果主要點無效，則不進行最近鄰搜索，直接返回None
     return None
 
 def process_line_data(file_path, geotiff_path):
@@ -46,7 +40,6 @@ def process_line_data(file_path, geotiff_path):
         print(f"Error reading the input file: {e}")
         return
 
-    # 檢查 CRS 並處理
     if gdf.crs is None:
         print("CRS is missing in the input GIS file.")
         gdf.set_crs("EPSG:3826", inplace=True)
@@ -54,7 +47,6 @@ def process_line_data(file_path, geotiff_path):
     else:
         print(f"Input file CRS: {gdf.crs}")
 
-    # 顯示欄位和樣本
     if not display_fields_and_samples(gdf):
         return
 
@@ -99,7 +91,6 @@ def process_line_data(file_path, geotiff_path):
             current_distance = 0
 
             original_points = []
-            # 總是收集原始節點，但根據參數決定是否使用
             if line.geom_type == 'LineString':
                 original_points = list(line.coords)
             elif line.geom_type == 'MultiLineString':
@@ -107,15 +98,13 @@ def process_line_data(file_path, geotiff_path):
                     original_points.extend(linestring.coords)
 
             points = set()
-            
-            # 如果間距為0，僅使用原始節點
+
             if fixed_distance == 0:
                 for pt in original_points:
                     point = Point(pt)
                     distance_along_line = line.project(point)
                     points.add((point, distance_along_line))
             else:
-                # 正常處理固定間距節點
                 while current_distance <= length:
                     point = line.interpolate(current_distance)
                     points.add((point, current_distance))
@@ -132,25 +121,51 @@ def process_line_data(file_path, geotiff_path):
                         points.add((point, distance_along_line))
 
             sorted_points = sorted(points, key=lambda x: x[1])
-
             prev_point = None
+            azimuths = []
+
             for i, (point, distance_along_line) in enumerate(sorted_points):
                 lon, lat = transformer_to_4326.transform(point.x, point.y)
-                
-                # 取樣高程，如果無效則為None
                 elevation = sample_elevation(point, geotiff_array, transform, fixed_distance * 2, nodata_value) if use_geotiff else None
 
                 distance_meters = None
                 length_3d = None
+                azimuth = None
+
                 if prev_point:
-                    prev_lon, prev_lat, prev_elevation = prev_point
-                    distance_meters = round(point.distance(Point(sorted_points[i-1][0])), 3)
+                    dx = point.x - sorted_points[i - 1][0].x
+                    dy = point.y - sorted_points[i - 1][0].y
+                    if dx != 0 or dy != 0:
+                        angle_rad = np.arctan2(dx, dy)
+                        azimuth = (np.degrees(angle_rad) + 360) % 360
+
+                    distance_meters = round(point.distance(sorted_points[i - 1][0]), 3)
                     total_2d_length += distance_meters
 
-                    if use_geotiff and elevation is not None and prev_elevation is not None:
-                        dz = elevation - prev_elevation
+                    if use_geotiff and elevation is not None and prev_point[2] is not None:
+                        dz = elevation - prev_point[2]
                         length_3d = sqrt(distance_meters ** 2 + dz ** 2)
                         total_3d_length += length_3d
+
+                azimuths.append(azimuth)
+                prev_point = (lon, lat, elevation)
+
+            for i, (point, distance_along_line) in enumerate(sorted_points):
+                lon, lat = transformer_to_4326.transform(point.x, point.y)
+                elevation = sample_elevation(point, geotiff_array, transform, fixed_distance * 2, nodata_value) if use_geotiff else None
+                distance_meters = None
+                length_3d = None
+
+                if i == 0 and len(azimuths) > 1:
+                    azimuth_value = azimuths[1]
+                else:
+                    azimuth_value = azimuths[i]
+
+                if i > 0:
+                    distance_meters = round(point.distance(sorted_points[i - 1][0]), 3)
+                    if use_geotiff and elevation is not None and azimuth_value is not None:
+                        dz = elevation - sorted_points[i - 1][0].z if hasattr(sorted_points[i - 1][0], 'z') else 0
+                        length_3d = sqrt(distance_meters ** 2 + dz ** 2)
 
                 node_data = {
                     "Longitude": lon,
@@ -159,7 +174,8 @@ def process_line_data(file_path, geotiff_path):
                     "Northing": point.y,
                     "Elevation": elevation if use_geotiff else None,
                     "Distance": distance_meters,
-                    "Length_3D": length_3d if (use_geotiff and elevation is not None and prev_point and prev_point[2] is not None) else None,
+                    "Length_3D": length_3d if (use_geotiff and elevation is not None) else None,
+                    "Azimuth": round(azimuth_value, 3) if azimuth_value is not None else None,
                     "KP": round(distance_along_line, 3),
                     "Total_3D_Length": total_3d_length if (use_geotiff and elevation is not None) else None,
                     field_name: unique_value
@@ -172,7 +188,6 @@ def process_line_data(file_path, geotiff_path):
 
                 nodes_data.append(node_data)
                 geometry_data.append(Point(point.x, point.y))
-                prev_point = (lon, lat, elevation)
 
         if nodes_data:
             segment_count += 1
