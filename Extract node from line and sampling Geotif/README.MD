@@ -52,11 +52,13 @@
 - Includes:
   - Spatial coordinates (`Easting`, `Northing`, `Longitude`, `Latitude`).
   - Elevation.
+  - Azimuth
   - Distances:
     - `Distance_Meters`: Segment distance between consecutive points.
     - `Length_3D`: 3D distance considering elevation.
     - `Total_Distance`: Cumulative 2D distance.
     - `Total_3D_Length`: Cumulative 3D distance.
+
 
 ### Summary Report
 - Consolidates:
